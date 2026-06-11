@@ -1,0 +1,1783 @@
+/*************************************************************************
+ * Copyright (c) 2023-2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * License for AMD contributions = MIT. See LICENSE for more information
+ ************************************************************************/
+#include <type_traits>
+#include <transformer_engine/gemm.h>
+#include <transformer_engine/multi_stream.h>
+#include <transformer_engine/transformer_engine.h>
+#include <map>
+#include <unistd.h>
+#include <vector>
+#include <forward_list>
+#include <mutex>
+#include <unordered_map>
+#include <sstream>
+#include <fstream>
+#include <chrono>
+#include <optional>
+#include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+
+#include <iostream>
+#include <cstdlib>
+#include <string>
+#include <cstdint>
+#include <cstring>
+
+#include "../common.h"
+#include "../util/vectorized_pointwise.h"
+#include "../util/logging.h"
+
+namespace transformer_engine {
+
+namespace {
+
+template<typename T> 
+struct CacheEntry {
+  T value;
+  hipEvent_t event;
+
+  constexpr CacheEntry() : value(), event(nullptr) {}
+  
+  bool isValid() const { return event != nullptr; }
+
+  bool isAvailable() const
+  {
+    if (event == nullptr)
+      return false;
+
+    hipError_t err = hipEventQuery(event);
+    if (err == hipSuccess)
+    {
+      return true;
+    }
+    else if (err == hipErrorNotReady)
+    {
+      return false;
+    }
+    else
+    {
+      NVTE_ERROR("Invalid event: err=", std::to_string(err), " ", hipGetErrorString(err));
+      return false;
+    }
+  }
+};
+
+template<typename T, typename K> 
+class ObjCache {
+public:
+  using Data = std::unordered_map<K, std::unordered_map<hipStream_t, CacheEntry<T>>>;
+  static constexpr CacheEntry<T> invalidEntry{};
+
+  const CacheEntry<T>& get(const K& key, const hipStream_t stream) const
+  {
+    auto key_itr = data.find(key); 
+    if (key_itr == data.end())
+      return invalidEntry;
+
+    auto key_item = key_itr->second;
+
+    if (auto itr = key_item.find(stream); itr != key_item.end())
+      return itr->second;
+
+    return invalidEntry;
+  }
+
+  CacheEntry<T> acquire(const K& key, hipStream_t stream, bool get_available = true)
+  {
+    auto key_itr = data.find(key); 
+    if (key_itr == data.end())
+      return invalidEntry;
+
+    auto key_item = key_itr->second;
+
+    if (auto itr = key_item.find(stream); itr != key_item.end())
+    {
+      auto ret = itr->second;
+      key_item.erase(itr);
+      return ret;
+    }
+    
+    if (!get_available)
+      return invalidEntry;
+
+    for (auto itr = key_item.begin(); itr != key_item.end(); ++itr) {
+      if (itr->second.isAvailable()) {
+        auto ret = itr->second;
+        key_item.erase(itr);
+        return ret;
+      }
+    }
+    return invalidEntry;
+  }
+
+  void set(const K& key, hipStream_t stream, const CacheEntry<T>& item)
+  { 
+    data[key][stream] = item; 
+  }
+
+  ObjCache(void (*a_offload)(const Data&)): offload(a_offload) {}
+
+  ~ObjCache()
+  {
+    if (!data.empty() && offload != nullptr)
+    {
+      offload(data);
+    }
+  }
+
+protected:
+  void (*offload)(const Data&);
+  Data data;
+};
+
+template<typename T, typename K>
+class ObjPool: public ObjCache<T, K> {
+  public:
+    const CacheEntry<T>& get(const K& key, const hipStream_t stream) const
+    {
+      std::lock_guard<std::mutex> lock(mt);
+      return ObjCache<T, K>::get(key, stream);
+    }
+
+    CacheEntry<T> acquire(const K& key, const hipStream_t stream, bool get_available = true)
+    {
+      std::lock_guard<std::mutex> lock(mt);
+      return ObjCache<T, K>::acquire(key, stream, get_available);
+    }
+
+    void store(const typename ObjCache<T, K>::Data &cache)
+    {
+      std::lock_guard<std::mutex> lock(mt);
+      for (const auto &it: cache)
+      {
+        for (const auto &it2: it.second)
+        {
+          ObjCache<T, K>::set(it.first, it2.first, it2.second);
+        }
+      }
+    }
+
+  ObjPool(): ObjCache<T, K>(nullptr) {}
+
+  private:
+    mutable std::mutex mt;
+};
+  
+
+static hipDataType get_hipblaslt_dtype(const transformer_engine::DType t) {
+  switch (t) {
+    case DType::kFloat16:
+      return HIP_R_16F;
+    case DType::kFloat32:
+      return HIP_R_32F;
+    case DType::kBFloat16:
+      return HIP_R_16BF;
+    case DType::kFloat8E4M3:
+      return te_fp8_fnuz() ? HIP_R_8F_E4M3_FNUZ : HIP_R_8F_E4M3;
+    case DType::kFloat8E5M2:
+      return te_fp8_fnuz() ? HIP_R_8F_E5M2_FNUZ: HIP_R_8F_E5M2;
+    default:
+      NVTE_ERROR("Invalid type");
+  }
+}
+
+//TODO: merge duplicated logics with cublaslt_gemm.cu
+struct GemmParam {
+  void *A = nullptr;
+  void *B = nullptr;
+  cublasOperation_t transA = CUBLAS_OP_N;
+  cublasOperation_t transB = CUBLAS_OP_N;
+  transformer_engine::DType Atype = transformer_engine::DType::kNumTypes;
+  transformer_engine::DType Btype = transformer_engine::DType::kNumTypes;
+  void *A_scale_inv = nullptr;
+  void *B_scale_inv = nullptr;
+  int lda = 0;  // A column strides
+  int ldb = 0;  // B column strides
+};
+
+// FP4 e2m1 lookup table
+__device__ constexpr float kFP4E2M1Table[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+   -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+};
+
+// Dequantize FP4 (e2m1) packed data with FP8 e4m3 block scales to BF16.
+// Only applies block scales: output = fp4_value * block_scale.
+// The per-tensor amax correction is applied separately via the GEMM alpha scalar.
+//
+// Scale layout: 2D tensor of shape {num_rows_padded, scale_stride} where
+// scale_stride = roundup(num_cols / 16, 4).  Each scale covers a block of 16
+// consecutive elements along the fast (column) dimension.
+__global__ void dequant_fp4_to_bf16_kernel(
+    const uint8_t* __restrict__ data,
+    const fp8e4m3* __restrict__ scale_inv,
+    hip_bfloat16* __restrict__ output,
+    int64_t total_elements,
+    int64_t num_cols,
+    int64_t scale_stride)
+{
+  // Process 2 elements (1 byte) per iteration for coalesced access
+  const int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total_pairs = total_elements / 2;
+  if (pair_idx >= total_pairs) return;
+
+  const uint8_t byte = data[pair_idx];
+  const uint8_t lo_nibble = byte & 0xF;
+  const uint8_t hi_nibble = byte >> 4;
+
+  const int64_t elem_base = pair_idx * 2;
+  const int64_t row0 = elem_base / num_cols;
+  const int64_t col0 = elem_base % num_cols;
+  const int64_t row1 = (elem_base + 1) / num_cols;
+  const int64_t col1 = (elem_base + 1) % num_cols;
+  const float s0 = static_cast<float>(scale_inv[row0 * scale_stride + col0 / 16]);
+  const float s1 = static_cast<float>(scale_inv[row1 * scale_stride + col1 / 16]);
+
+  output[elem_base]     = static_cast<hip_bfloat16>(kFP4E2M1Table[lo_nibble] * s0);
+  output[elem_base + 1] = static_cast<hip_bfloat16>(kFP4E2M1Table[hi_nibble] * s1);
+}
+
+// Launch helper for dequant kernel
+static void launch_dequant_fp4_to_bf16(
+    const void* data, const void* scale_inv,
+    void* output, int64_t total_elements,
+    int64_t num_cols, int64_t scale_stride,
+    hipStream_t stream)
+{
+  constexpr int kBlockSize = 256;
+  const int64_t total_pairs = total_elements / 2;
+  const int64_t num_blocks = (total_pairs + kBlockSize - 1) / kBlockSize;
+
+  dequant_fp4_to_bf16_kernel<<<num_blocks, kBlockSize, 0, stream>>>(
+      reinterpret_cast<const uint8_t*>(data),
+      reinterpret_cast<const fp8e4m3*>(scale_inv),
+      reinterpret_cast<hip_bfloat16*>(output),
+      total_elements, num_cols, scale_stride);
+}
+
+// Compute per-row alpha vector on device for NVFP4 GEMM:
+//   alpha_out[i] = alpha_in * amax_A * amax_B / (fp4_max^2 * fp8_max^2)  for i in [0, m)
+// Used with HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST, which
+// expects a device vector of length m for alpha, while beta stays on the host.
+__global__ void compute_fp4_alpha_vector_kernel(float alpha_in, const float* __restrict__ amax_A,
+                                                const float* __restrict__ amax_B, float factor_inv,
+                                                float* __restrict__ alpha_out, int m) {
+  const float alpha_val = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < m; i += blockDim.x * gridDim.x) {
+    alpha_out[i] = alpha_val;
+  }
+}
+
+GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cublasOperation_t transA,
+                                const transformer_engine::Tensor &B, const cublasOperation_t transB,
+                                const int m, const int n, const int k) {
+  using namespace transformer_engine;
+  NVTE_CHECK(A.scaling_mode == B.scaling_mode,
+             "Inputs A and B to GEMM need to have the same scaling mode!");
+  NVTE_CHECK(A.has_data() || A.has_columnwise_data(), "Input A does not hold any data!");
+  NVTE_CHECK(B.has_data() || B.has_columnwise_data(), "Input B does not hold any data!");
+  GemmParam ret;
+
+  // Transpose mode with column-major ordering
+  bool is_A_transposed = transA == CUBLAS_OP_T;
+  bool is_B_transposed = transB == CUBLAS_OP_T;
+
+
+  if (is_tensor_scaling(A.scaling_mode)) {
+    // Unscaled or FP8 tensor scaling
+    ret.A = A.data.dptr;
+    ret.transA = transA;
+    ret.Atype = A.data.dtype;
+    ret.A_scale_inv = A.scale_inv.dptr;
+    ret.lda = is_A_transposed ? k : m;
+    if (!nvte_is_non_tn_fp8_gemm_supported() && !is_A_transposed) {
+      if (A.has_columnwise_data() && is_fp8_dtype(A.columnwise_data.dtype)) {
+        ret.A = A.columnwise_data.dptr;
+        ret.transA = CUBLAS_OP_T;
+        ret.Atype = A.columnwise_data.dtype;
+        ret.A_scale_inv = A.columnwise_scale_inv.dptr;
+        ret.lda = k;
+      } else {
+        NVTE_CHECK(!is_fp8_dtype(ret.Atype), "Input A is missing column-wise usage");
+      }
+    }
+  } else if (is_mxfp_scaling(A.scaling_mode)) {
+    // MXFP8
+    // Note: Row-wise and column-wise data are scaled along different
+    // dimensions (with matrix interpreted in row-major order).
+    if (is_A_transposed) {
+      NVTE_CHECK(A.has_data(), "Input A is missing row-wise usage");
+    } else {
+      NVTE_CHECK(A.has_columnwise_data(), "Input A is missing column-wise usage");
+    }
+    ret.A = is_A_transposed ? A.data.dptr : A.columnwise_data.dptr;
+    ret.transA = transA;
+    ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+    ret.A_scale_inv = is_A_transposed ? A.scale_inv.dptr : A.columnwise_scale_inv.dptr;
+    ret.lda = is_A_transposed ? k : m;
+  } else if (is_nvfp_scaling(A.scaling_mode)) {
+    // NVFP4: dequant path always produces TN layout for the BF16 GEMM,
+    // but the source data may come from either rowwise or columnwise buffers.
+    ret.A = is_A_transposed ? A.data.dptr : A.columnwise_data.dptr;
+    ret.transA = CUBLAS_OP_T;  // NVFP4 gemm is always TN layout
+    ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+    ret.A_scale_inv = is_A_transposed ? A.scale_inv.dptr : A.columnwise_scale_inv.dptr;
+    ret.lda = k;
+  } else {
+    NVTE_ERROR("A has unsupported scaling mode");
+  }
+
+  // Configure B matrix
+  if (is_tensor_scaling(B.scaling_mode)) {
+    // Unscaled or FP8 tensor scaling
+    ret.B = B.data.dptr;
+    ret.transB = transB;
+    ret.Btype = B.data.dtype;
+    ret.B_scale_inv = B.scale_inv.dptr;
+    ret.ldb = is_B_transposed ? n : k;
+    if (!nvte_is_non_tn_fp8_gemm_supported() && is_B_transposed) {
+      if (B.has_columnwise_data() && is_fp8_dtype(B.columnwise_data.dtype)) {
+        ret.B = B.columnwise_data.dptr;
+        ret.transB = CUBLAS_OP_N;
+        ret.Btype = B.columnwise_data.dtype;
+        ret.B_scale_inv = B.columnwise_scale_inv.dptr;
+        ret.ldb = k;
+      } else {
+        NVTE_CHECK(!is_fp8_dtype(ret.Btype), "Input B is missing column-wise usage");
+      }
+    }
+  } else if (is_mxfp_scaling(B.scaling_mode)) {
+    // MXFP8
+    // Note: Row-wise and column-wise data are scaled along different
+    // dimensions (with matrix interpreted in row-major order).
+    if (is_B_transposed) {
+      NVTE_CHECK(B.has_columnwise_data(), "Input B is missing column-wise usage");
+    } else {
+      NVTE_CHECK(B.has_data(), "Input B is missing row-wise usage");
+    }
+    ret.B = is_B_transposed ? B.columnwise_data.dptr : B.data.dptr;
+    ret.transB = transB;
+    ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+    ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
+    ret.ldb = is_B_transposed ? n : k;
+  } else if (is_nvfp_scaling(B.scaling_mode)) {
+    // NVFP4: dequant path always produces TN layout for the BF16 GEMM,
+    // but the source data may come from either rowwise or columnwise buffers.
+    ret.B = is_B_transposed ? B.columnwise_data.dptr : B.data.dptr;
+    ret.transB = CUBLAS_OP_N;  // NVFP4 gemm is always TN layout
+    ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+    ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
+    ret.ldb = k;
+  } else {
+    NVTE_ERROR("B has unsupported scaling mode");
+  }
+
+  return ret;
+}
+
+// Dequantize FP4 inputs to BF16 in-place within the workspace and set up
+// the alpha device vector for the subsequent hipBLASLt GEMM.
+// After this call, param.A/B point to BF16 buffers within workspace,
+// param.Atype/Btype are kBFloat16, and *alpha_ptr_out points to a device vector.
+static void dequant_fp4_gemm_inputs(
+    GemmParam& param,
+    const transformer_engine::Tensor& inputA, cublasOperation_t transa,
+    const transformer_engine::Tensor& inputB, cublasOperation_t transb,
+    int m, int n, int k, float alpha,
+    void* workspace, size_t& workspaceSize,
+    const void** alpha_ptr_out, hipStream_t stream) {
+
+  const float fp4_max = 6.0f;
+  const float fp8_max = te_fp8_fnuz() ? 240.0f : 448.0f;
+  const float factor_inv = 1.0f / (fp4_max * fp4_max * fp8_max * fp8_max);
+
+  const float* amax_A = (transa == CUBLAS_OP_T)
+      ? reinterpret_cast<const float*>(inputA.amax.dptr)
+      : reinterpret_cast<const float*>(inputA.columnwise_amax.dptr);
+  const float* amax_B = (transb == CUBLAS_OP_N)
+      ? reinterpret_cast<const float*>(inputB.amax.dptr)
+      : reinterpret_cast<const float*>(inputB.columnwise_amax.dptr);
+
+  // Compute total extra bytes needed from the workspace:
+  //   alpha vector:  m * sizeof(float)
+  //   dequant A:     m * k * sizeof(bf16)   (if A is FP4)
+  //   dequant B:     k * n * sizeof(bf16)   (if B is FP4)
+  const size_t alpha_vec_bytes = static_cast<size_t>(m) * sizeof(float);
+  const size_t a_bf16_bytes = is_fp4_dtype(param.Atype)
+      ? static_cast<size_t>(m) * k * sizeof(hip_bfloat16) : 0;
+  const size_t b_bf16_bytes = is_fp4_dtype(param.Btype)
+      ? static_cast<size_t>(k) * n * sizeof(hip_bfloat16) : 0;
+  const size_t fp4_total_bytes = alpha_vec_bytes + a_bf16_bytes + b_bf16_bytes;
+  NVTE_CHECK(workspaceSize >= fp4_total_bytes,
+             "NVFP4 GEMM requires at least ", fp4_total_bytes, " bytes workspace (",
+             fp4_total_bytes / (1024 * 1024), " MiB) for alpha vector + BF16 dequant buffers, "
+             "but only ", workspaceSize, " bytes (", workspaceSize / (1024 * 1024),
+             " MiB) available. Increase the cuBLAS workspace size.");
+
+  // Carve regions from the end of the workspace.
+  // Layout: [cublas workspace ... | alpha_vec | dequant_a | dequant_b]
+  workspaceSize = (workspaceSize / sizeof(float)) * sizeof(float) - fp4_total_bytes;
+  uint8_t* ws_ptr = reinterpret_cast<uint8_t*>(workspace) + workspaceSize;
+
+  float* device_alpha_vec = reinterpret_cast<float*>(ws_ptr);
+  ws_ptr += alpha_vec_bytes;
+
+  NVTE_CHECK(amax_A != nullptr, "FP4 GEMM requires amax_A");
+  NVTE_CHECK(amax_B != nullptr, "FP4 GEMM requires amax_B");
+  constexpr int kBlockSize = 256;
+  const int num_blocks = (m + kBlockSize - 1) / kBlockSize;
+  compute_fp4_alpha_vector_kernel<<<num_blocks, kBlockSize, 0, stream>>>(
+      alpha, amax_A, amax_B, factor_inv, device_alpha_vec, m);
+  *alpha_ptr_out = static_cast<const void*>(device_alpha_vec);
+
+  // Stage FP4 operand: dequantize to BF16 in workspace and update GEMM param.
+  auto stage_fp4_operand = [&](DType& op_type, void*& op_data,
+                               void*& op_scale_inv,
+                               const transformer_engine::Tensor& input,
+                               bool use_rowwise, int64_t rows, int64_t cols,
+                               size_t bf16_bytes) {
+    if (!is_fp4_dtype(op_type))
+      return;
+
+    hip_bfloat16* bf16_buf = reinterpret_cast<hip_bfloat16*>(ws_ptr);
+    ws_ptr += bf16_bytes;
+    const auto& sinv = use_rowwise ? input.scale_inv : input.columnwise_scale_inv;
+    const int64_t num_cols = use_rowwise ? input.data.shape.back()
+                                        : input.columnwise_data.shape.back();
+    const int64_t scale_stride = (sinv.shape.size() >= 2) ? sinv.shape[1] : (num_cols / 16);
+    launch_dequant_fp4_to_bf16(op_data, op_scale_inv, bf16_buf,
+                               rows * cols, num_cols, scale_stride, stream);
+    op_data = bf16_buf;
+    op_type = DType::kBFloat16;
+    op_scale_inv = nullptr;
+  };
+
+  // Dequantize FP4 -> BF16 (block scales only, no amax folded in)
+  stage_fp4_operand(param.Atype, param.A, param.A_scale_inv,
+                    inputA, transa == CUBLAS_OP_T, m, k, a_bf16_bytes);
+  stage_fp4_operand(param.Btype, param.B, param.B_scale_inv,
+                    inputB, transb == CUBLAS_OP_N, k, n, b_bf16_bytes);
+}
+
+
+static class HandlePool {
+public:
+  hipblasLtHandle_t get(int device_id) 
+  {
+    std::lock_guard<std::mutex> lock(mt);
+
+    if (pool.empty())
+    {
+      int device_count = 0; 
+      NVTE_CHECK_CUDA(hipGetDeviceCount(&device_count));
+      pool.resize(device_count);
+      return nullptr;
+    }
+
+    if (!pool[device_id].empty())
+    {
+      hipblasLtHandle_t h = pool[device_id].front();
+      pool[device_id].pop_front();
+      return h;
+    }
+
+    return nullptr;
+  }
+
+  hipblasLtHandle_t obtain(int device_id) 
+  {
+    hipblasLtHandle_t h = get(device_id);
+    if (h == nullptr)
+    {
+      NVTE_CHECK_HIPBLASLT(hipblasLtCreate(&h));
+    }
+    return h;
+  }
+
+  void store(const std::vector<hipblasLtHandle_t>& handles)
+  {
+    std::lock_guard<std::mutex> lock(mt);
+    if (pool.empty())
+    {
+      std::cout << "[ERROR] Attempt to store handles to invalid pool" << std::endl;
+    }
+    for (unsigned int i=0; i<pool.size(); i++)
+    {
+      if (handles[i] != nullptr)
+      {
+        pool[i].push_front(handles[i]);
+      }
+    }
+  }
+
+  ~HandlePool() {
+#if DESTROY_HIPBLASLT_HANDLES_POOL
+    std::lock_guard<std::mutex> lock(mt);
+    for (auto & hlist : pool)
+    {
+      for (auto & h : hlist)
+      {
+        hipblasLtDestroy(h);
+      }
+    }
+    pool.clear();
+#endif
+  }
+
+  inline size_t get_size() const
+  {
+    return pool.size();
+  }
+
+private:
+  std::mutex mt;
+  using Pool = std::vector<std::forward_list<hipblasLtHandle_t>>;
+  // Order of destructors between thread_local and global is not actually guaranteed
+  // As a simple w/a make pool storage "leaky"
+  // Just do not destruct it and do not destroy hipbladLt handles
+  // Let OS deal with it on application exit
+#if DESTROY_HIPBLASLT_HANDLES_POOL
+  Pool pool;
+#else
+  Pool &pool = *new Pool();
+#endif
+} handle_pool;
+
+
+thread_local static class HandleCache {
+public:
+  hipblasLtHandle_t get(int device_id) const
+  {
+    return d.empty() ? nullptr : d[device_id];
+  }
+
+  hipblasLtHandle_t obtain(int device_id)
+  {
+    hipblasLtHandle_t h = get(device_id);
+    if (h)
+    {
+      return h;
+    }
+    h = handle_pool.obtain(device_id);
+    set(device_id, h);
+    return h;
+  }
+
+  void set(int device_id, hipblasLtHandle_t h) 
+  { 
+    if (d.empty())
+    {
+      d.resize(handle_pool.get_size());
+    }
+    d[device_id] = h;
+  }
+
+  ~HandleCache()
+  {
+    if (!d.empty())
+    {
+      handle_pool.store(d);
+    }
+  }
+
+private:
+  std::vector<hipblasLtHandle_t> d;
+} cached_handles;
+
+
+class csv_helper
+{
+public:
+  struct start {};
+  struct end {};
+
+  csv_helper(std::ostream& os, char sep_val) : m_os{ os }, m_sep_val(sep_val), m_start(true), m_sep("") {}
+
+  csv_helper& operator << (const start&)
+  {
+    m_start = true;
+    return *this;
+  }
+
+  csv_helper& operator << (const end&)
+  {
+    m_sep="";
+    m_start = false;
+    return *this;
+  }
+
+  template< typename T>
+  csv_helper& operator<<(const T& v)
+  {
+    m_os << m_sep << v;
+    if (m_start)
+    {
+      m_start = false;
+      m_sep = m_sep_val;
+    }
+    return *this;
+  }
+
+private:
+  std::ostream& m_os;
+  char m_sep_val;
+  bool m_start;
+  std::string m_sep;
+};
+
+
+template<typename T>
+class NameMapper
+{
+public:
+  NameMapper(const std::unordered_map<T, std::string_view>& name_map): map(name_map) {}
+  const std::string_view &getName(const T &val) {
+    return map.at(val);
+  }
+  T getValue(const std::string& name, const char *label="", std::function<bool(const T&)> filter = nullptr)
+  {
+    for (auto iter = map.begin(); iter != map.end(); ++iter)
+    {
+      if ((name == iter->second) && (!filter || filter(iter->first))) return iter->first;
+    }
+    NVTE_ERROR("Invalid ", label, " name: ", name);
+  }
+protected: 
+  const std::unordered_map<T, std::string_view> &map;
+};
+
+static std::unordered_map<hipDataType, std::string_view> type_name_map = {
+  {HIP_R_32F, "float32"},
+  {HIP_R_16F, "float16"},
+  {HIP_R_16BF, "bfloat16"},
+  {HIP_R_8F_E4M3_FNUZ, "float8e4m3"},
+  {HIP_R_8F_E5M2_FNUZ, "float8e5m2"},
+  {HIP_R_8F_E4M3, "float8e4m3"},
+  {HIP_R_8F_E5M2, "float8e5m2"},
+};
+static NameMapper<hipDataType> typeNameMapper(type_name_map);
+
+static std::unordered_map<hipblasOperation_t, std::string_view> trans_name_map = {
+  {HIPBLAS_OP_N, "N"},
+  {HIPBLAS_OP_T, "T"}
+};
+static NameMapper<hipblasOperation_t> transposeNameMapper(trans_name_map);
+
+static std::unordered_map<hipblasLtEpilogue_t, std::string_view> epi_name_map = {
+  {HIPBLASLT_EPILOGUE_DEFAULT, "-"},
+  {HIPBLASLT_EPILOGUE_BIAS, "bias"},
+  {HIPBLASLT_EPILOGUE_GELU_AUX, "geluaux"},
+  {HIPBLASLT_EPILOGUE_GELU_AUX_BIAS, "geluauxbias"},
+  {HIPBLASLT_EPILOGUE_DGELU, "dgelu"},
+  {HIPBLASLT_EPILOGUE_DGELU_BGRAD, "dgelubgrad"},
+  {HIPBLASLT_EPILOGUE_BGRADB, "bgradb"}
+};
+static NameMapper<hipblasLtEpilogue_t> epilogueNameMapper(epi_name_map);
+
+static std::unordered_map<hipblasComputeType_t, std::string_view> comp_name_map = {
+  {HIPBLAS_COMPUTE_32F, "f32"}
+};
+static NameMapper<hipblasComputeType_t> computeNameMapper(comp_name_map);
+
+static class GemmAlgoCache {
+public:
+  struct Key {
+    int deviceCap;
+    hipDataType a_type, b_type, d_type, bias_type, aux_type;
+    int m, n, k;
+    int lda, ldb, ldd;
+    hipblasOperation_t transa, transb;
+    //Make it int instead of hipblasLtMatmulMatrixScale_t for compatibility with old hipblasLt
+    int scaling_mode;
+    hipblasLtEpilogue_t epilogue;
+    bool fp4_alpha_device_vector;  // FP4 uses ALPHA_DEVICE_VECTOR pointer mode
+
+    Key(int deviceCap_,
+        hipDataType a_type_, hipDataType b_type_,
+        hipDataType d_type_, hipDataType bias_type_, hipDataType aux_type_,
+        int m_, int n_, int k_, int lda_, int ldb_, int ldd_,
+        hipblasOperation_t transa_, hipblasOperation_t transb_,
+        int scaling_mode_, hipblasLtEpilogue_t epilogue_,
+        bool fp4_alpha_device_vector_)
+    {
+      // Zero the whole object (including padding bytes) BEFORE assigning the
+      // members, so the byte-wise Comp below never compares stack garbage.
+      std::memset(this, 0, sizeof(*this));
+      deviceCap = deviceCap_;
+      a_type = a_type_; b_type = b_type_;
+      d_type = d_type_; bias_type = bias_type_; aux_type = aux_type_;
+      m = m_; n = n_; k = k_; lda = lda_; ldb = ldb_; ldd = ldd_;
+      transa = transa_; transb = transb_;
+      scaling_mode = scaling_mode_; epilogue = epilogue_;
+      fp4_alpha_device_vector = fp4_alpha_device_vector_;
+    }
+
+    Key() { std::memset(this, 0, sizeof(*this)); }
+
+    bool operator==(const Key &val) const
+    {
+      return ((deviceCap == val.deviceCap)
+      && (a_type == val.a_type) && (b_type == val.b_type)
+      && (d_type == val.d_type) && (bias_type == val.bias_type)
+      && (aux_type == val.aux_type)
+      && (m == val.m) && (n == val.n) && (k == val.k)
+      && (lda == val.lda) && (ldb == val.ldb) && (ldd == val.ldd)
+      && (transa == val.transa) && (transb == val.transb)
+      && (scaling_mode == val.scaling_mode) && (epilogue == val.epilogue)
+      && (fp4_alpha_device_vector == val.fp4_alpha_device_vector) );
+    }
+
+    struct Comp
+    {
+      bool operator()(const Key& lhs, const Key& rhs) const
+      {
+        // Safe because Key zero-inits all padding in its constructors, so the
+        // byte representation is fully determined by the logical fields.
+        return ::std::string_view((const char*)&lhs, sizeof(lhs)) < ::std::string_view((const char*)&rhs, sizeof(rhs));
+      }
+    };
+  };
+
+  void init()
+  {
+    std::lock_guard<std::mutex> lock(mt);
+    int device_count = 0; 
+    NVTE_CHECK_CUDA(hipGetDeviceCount(&device_count));
+    dev_cap.resize(device_count);
+    for (int i=0; i<device_count; i++)
+    {
+      hipDeviceProp_t prop;
+      NVTE_CHECK_CUDA(hipGetDeviceProperties(&prop, i));
+      dev_cap[i] = prop.major*100 + prop.minor;
+    }
+    load_();
+    save_();
+  }
+
+  inline int device_cap(int device_id)
+  {
+    if (dev_cap.empty())
+      init();
+    return dev_cap[device_id];
+  }
+
+  struct Algo {
+    std::optional<hipblasLtMatmulAlgo_t> algo;
+    int64_t algoId;
+    int index;
+    size_t ws_size_min;
+    size_t ws_size_max;
+    Algo(): algo(), index(-1), algoId(), ws_size_min(0), ws_size_max(0) {}
+    Algo(int idx, int64_t id, size_t ws_min, size_t ws_max): algo(), index(idx), algoId(id), ws_size_min(ws_min), ws_size_max(ws_max) {}
+    inline bool hasId() { return index>=0; } const
+    static inline int64_t getAlgoId(const hipblasLtMatmulAlgo_t &algo)
+    {
+      return *(const int64_t*)&algo;
+    }
+  };
+
+  bool find(const Key &cfg, size_t ws_size, Algo &algo)
+  {
+    std::lock_guard<std::mutex> lock(mt);
+    if (auto *pentry = find_(cfg, ws_size, ws_size); pentry != nullptr)
+    {
+      algo = *pentry;
+      return true;
+    }
+    return false;
+  }
+
+  void store(const Key &cfg, const Algo &algo)
+  {
+    size_t ws_size_min = algo.ws_size_min;
+    size_t ws_size_max = algo.ws_size_max;
+    NVTE_CHECK(ws_size_max >= ws_size_min, "Invalid WS size");
+    std::lock_guard<std::mutex> lock(mt);
+
+    //Remove overlapping with existing entries;
+    while (auto* pentry = find_(cfg, ws_size_min, ws_size_max)) {
+      if (pentry->ws_size_min <= ws_size_min && pentry->ws_size_max >= ws_size_max)
+      {
+        *pentry = algo;
+        save_();
+        return;
+      }
+
+      if (ws_size_max > pentry->ws_size_max)
+      {
+        ws_size_min = pentry->ws_size_max + 1;
+      }
+      else if (ws_size_min < pentry->ws_size_min)
+      {
+        ws_size_max = pentry->ws_size_min - 1;
+      }
+      else
+      {
+        //Should never be here
+        NVTE_ERROR("Cannot merge WS size range");
+      }
+    }
+
+    //Merge to adjusted entry if possible
+    auto* pentry = find_(cfg, ws_size_min - 1, ws_size_min);
+    if (pentry && pentry->algoId == algo.algoId)
+    {
+      pentry->algo = algo.algo;
+      pentry->ws_size_max = ws_size_max;
+      save_();
+    }
+    else
+    {
+      auto it = d.emplace(cfg, algo);
+      it->second.ws_size_min = ws_size_min;
+      it->second.ws_size_max = ws_size_max;
+      save_(it->first, it->second);
+    }
+  }
+
+protected:
+
+  Algo* find_(const Key &cfg, size_t ws_min, size_t ws_max)
+  {
+    const auto key_range = d.equal_range(cfg);
+    for (auto i = key_range.first; i != key_range.second; i++)
+    {
+      if (ws_min <= i->second.ws_size_max && ws_max >= i->second.ws_size_min)
+      {
+        return &i->second;
+      }
+    }
+    return nullptr;
+  }
+
+  void header_(std::ostream& ofs)
+  {
+    csv_helper fs(ofs, csv_sep);
+    fs << "dev_cap" << "m" << "n"  << "k" << "trans_a" << "trans_b" 
+    << "type_a" << "type_b" << "type_d" << "bias_type" << "aux_type"
+    << "lda" << "ldb" << "ldd" << "scale_mode" << "epi" << "comp" << "scale_type"
+    << "fp4_alpha" << "ws_min" << "ws_max" << "algo_id" << "aidx";
+  }
+  
+  void load_()
+  {
+    const char* env = std::getenv("TE_HIPBLASLT_ALGO_LOAD");
+    if (env == nullptr || env[0] == '\0')
+    {
+      return;
+    }
+    std::ifstream ifs{env};
+    if (!ifs.is_open())
+    {
+      std::cerr << "Could not load autotune results storage " << env << "\n";
+      return;
+    }
+    std::cout << "Loading autotune results from " << env << "\n";
+
+    Key cfg;
+    std::string line;
+    std::getline(ifs, line); // the first line with legend
+    {
+      std::ostringstream hline;
+      header_(hline);
+      if (hline.str() != line) {
+        std::cerr << "Incorrect algo storage legend. Expected " << hline.str() << "\n";
+        return;
+      }
+    }
+
+    while(std::getline(ifs, line)) 
+    {
+      line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+      if (auto pos = line.find_last_not_of(" \t\n\r\f\v"); pos != std::string::npos)
+      {
+        line.resize(pos+1);
+      }
+      if (line.empty() || line[0] == '#') continue;
+      std::istringstream is(line);
+      char c;
+      std::string type_a, type_b, type_d, bias_type, aux_type, trans_a, trans_b, epi, comp, scale;
+      int64_t algo_id;
+      int algo_idx;
+      size_t ws_min, ws_max;
+
+      is >> std::skipws;
+      is >> cfg.deviceCap >> c >> cfg.m >> c >> cfg.n >> c >> cfg.k >> c;
+
+      //Filter out entries for devices not presented on the curent system
+      bool b_found = false;
+      for (int i=0; i<dev_cap.size(); i++)
+      {
+        if (dev_cap[i] == cfg.deviceCap)
+        {
+          b_found = true;
+          break;
+        }
+      }
+      if (!b_found) continue;
+
+      std::getline(is, trans_a, csv_sep);
+      std::getline(is, trans_b, csv_sep);
+      std::getline(is, type_a, csv_sep);
+      std::getline(is, type_b, csv_sep);
+      std::getline(is, type_d, csv_sep);
+      std::getline(is, bias_type, csv_sep);
+      std::getline(is, aux_type, csv_sep);
+      is >> cfg.lda >> c >> cfg.ldb >> c >> cfg.ldd >> c >> cfg.scaling_mode >> c;
+      std::getline(is, epi, csv_sep);
+      std::getline(is, comp, csv_sep);
+      std::getline(is, scale, csv_sep);
+      int fp4_alpha = 0;
+      is >> fp4_alpha >> c >> ws_min >> c >> ws_max >> c >> algo_id >> c >> algo_idx;
+      cfg.fp4_alpha_device_vector = (fp4_alpha != 0);
+  
+      if (is.bad())
+      {
+        std::cerr << "Parsing CSV line failed: " << line << "\n";
+        return;
+      }
+
+      if (ws_min > ws_max)
+      {
+        std::cout << "[WARNING] Invalid WS size at " << line << "\n";
+        continue;
+      }
+
+      //Check and filter out compute and scale types
+      if (computeNameMapper.getValue(comp, "comp") != HIPBLAS_COMPUTE_32F ||
+        typeNameMapper.getValue(scale, "scale") != HIP_R_32F)
+      {
+        continue;
+      }
+
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+      if (cfg.scaling_mode < 0 || cfg.scaling_mode >= (int)HIPBLASLT_MATMUL_MATRIX_SCALE_END)
+#else
+      if (cfg.scaling_mode != 0)
+#endif
+      {
+        std::cout << "[WARNING] Unsupported scaling mode at " << line << "\n";
+        continue;
+      }
+
+      auto fp8_filter = te_fp8_fnuz()
+                            ? [](const hipDataType& val) 
+                                { return (val != HIP_R_8F_E4M3 && val != HIP_R_8F_E5M2); }
+                            : [](const hipDataType& val) {
+                                return (val != HIP_R_8F_E4M3_FNUZ && val != HIP_R_8F_E5M2_FNUZ);
+                              };
+
+      cfg.a_type = typeNameMapper.getValue(type_a, "type_a", fp8_filter);
+      cfg.b_type = typeNameMapper.getValue(type_b, "type_b", fp8_filter);
+      cfg.d_type = typeNameMapper.getValue(type_d, "type_d", fp8_filter);
+      cfg.bias_type = (bias_type == "-")
+                          ? (hipDataType)-1
+                          : typeNameMapper.getValue(bias_type, "bias_type", fp8_filter);
+      cfg.aux_type = (aux_type == "-")
+                          ? (hipDataType)-1
+                          : typeNameMapper.getValue(aux_type, "aux_type", fp8_filter);
+
+      cfg.transa = transposeNameMapper.getValue(trans_a, "trans_a");
+      cfg.transb = transposeNameMapper.getValue(trans_b, "trans_b");
+
+      cfg.epilogue = epilogueNameMapper.getValue(epi, "epi");
+
+      if (find_(cfg, ws_min, ws_max))
+      {
+          std::cout << "[WARNING] Duplicated/overlapped entry in algo cache\n";
+          continue;
+      }
+
+      d.emplace(cfg, Algo(algo_idx, algo_id, ws_min, ws_max));
+    }
+  }
+
+  bool can_save_(bool reopen = false)
+  {
+    if (!save_fs)
+    {
+      const char* temp = std::getenv("TE_HIPBLASLT_ALGO_SAVE");
+      if (temp == nullptr || temp[0] == '\0')
+      {
+        return false;
+      }
+
+      save_fs_name = temp;
+
+      pid_t pid = getpid();
+
+      size_t pos = 0;
+      while ((pos = save_fs_name.find("%i", pos)) != std::string::npos) {
+        save_fs_name.replace(pos, 2, std::to_string(pid));
+      }
+
+      save_fs = std::make_unique<std::ofstream>();
+      std::cout << "Saving autotune results to " << save_fs_name << "\n";
+    }
+
+    if (reopen)
+    {
+      if (save_fs->is_open())
+      {
+        save_fs->close();
+      }
+      save_fs->open(save_fs_name, std::ios_base::trunc);
+    }
+
+    if (save_fs->is_open() && !save_fs->bad())
+    {
+      return true;
+    }
+    else
+    {
+      if (reopen) std::cerr << "Could not open autotune results storage " << save_fs_name << "\n";
+      return false;
+    }
+  }
+
+  void save_()
+  {
+    if (!can_save_(true))
+    {
+      return;
+    }
+    header_(*save_fs);
+    *save_fs << "\n";
+
+    for (const auto &elem: d)
+    {
+      save_(elem.first, elem.second);
+    }
+  }
+
+  void save_(const Key &cfg, const Algo &algo)
+  {
+    if (!can_save_())
+    {
+      return;
+    }
+    csv_helper csv(*save_fs, csv_sep);
+    csv << cfg.deviceCap << cfg.m << cfg.n << cfg.k 
+      << transposeNameMapper.getName(cfg.transa) << transposeNameMapper.getName(cfg.transb)
+      << typeNameMapper.getName(cfg.a_type) << typeNameMapper.getName(cfg.b_type) << typeNameMapper.getName(cfg.d_type)
+      << ((cfg.bias_type == (hipDataType)-1) ? "-" : typeNameMapper.getName(cfg.bias_type))
+      << ((cfg.aux_type == (hipDataType)-1) ? "-" : typeNameMapper.getName(cfg.aux_type))
+      << cfg.lda << cfg.ldb << cfg.ldd << cfg.scaling_mode << epilogueNameMapper.getName(cfg.epilogue)
+      << computeNameMapper.getName(HIPBLAS_COMPUTE_32F) << typeNameMapper.getName(HIP_R_32F)
+      << (cfg.fp4_alpha_device_vector ? 1 : 0)
+      << algo.ws_size_min << algo.ws_size_max << algo.algoId << algo.index
+      << csv_helper::end() << "\n";
+  }
+
+private:
+  std::vector<int> dev_cap;
+  constexpr static char csv_sep = ','; 
+  std::unique_ptr<std::ofstream> save_fs;
+  std::string save_fs_name;
+  std::mutex mt;
+  /* Map of problem config to tuple of ws_size and Algo
+   * When searching, elements matching Key are filtered 
+   * for requested WS size be between Algo.ws_size and pair.first
+   */
+  std::multimap<Key, Algo, Key::Comp> d;
+} algoCache;
+
+static inline int getIntEnv(const char *name, int defval, int minval)
+{
+  int val = defval;
+  const char* env = std::getenv(name);
+  if (env != nullptr && env[0] != '\0')
+  {
+     val = atoi(env);
+     if (val < minval)
+     {
+        val = minval;
+     }
+  }
+  return val;
+}
+
+
+/* Warning: only call once per device!
+ * When calling nvte_multi_stream_cublas_gemm with hipblaslt backend
+ * need to create multiple handles corresponding to compute_streams
+ * to avoid a handle be used by multi-streams concurrently.
+ */
+static void init_hipblaslt_handles(hipblasLtHandle_t* hipblaslt_handles) {
+  NVTE_CHECK(hipblaslt_handles != nullptr);
+  for (int i = 0; i < nvte_get_num_compute_streams(); i++) {
+    NVTE_CHECK_HIPBLASLT(hipblasLtCreate(&hipblaslt_handles[i]));
+  }
+}
+
+
+void hipblaslt_gemm(const Tensor *inputA,
+                    const Tensor *inputB,
+                    Tensor *outputD,
+                    const Tensor *inputBias,
+                    Tensor *outputPreGelu,
+                    int m, int n, int k,
+                    int lda, int ldb, int ldd,
+                    hipblasOperation_t transa,
+                    hipblasOperation_t transb,
+                    bool grad,
+                    void* workspace,
+                    size_t workspaceSize,
+                    float alpha, float beta,
+                    bool use_split_accumulator,
+                    int math_sm_count,
+                    hipStream_t stream,
+                    hipblasLtHandle_t handle
+) {
+  // Return immediately if GEMM is trivial
+  if (m <= 0 || n <= 0) {
+    return;
+  }
+  NVTE_CHECK(k > 0);
+
+  GemmParam param = CanonicalizeGemmInput(*inputA, transa, *inputB, transb, m, n, k);
+
+  // FP4 dequant path: hipBLASLt does not support FP4 natively,
+  // so we dequantize FP4 -> BF16 (block scales only) and run a standard BF16 GEMM.
+  //
+  // The per-tensor amax correction is computed on-device as a per-row alpha vector:
+  //   alpha'[i] = alpha * amax_A * amax_B / (fp4_max^2 * fp8_max^2)
+  // Alpha is passed as a device vector of length m via
+  // HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST. Beta stays on host.
+  const bool use_fp4 = is_fp4_dtype(param.Atype) || is_fp4_dtype(param.Btype);
+  const void* alpha_ptr = static_cast<const void*>(&alpha);
+  const void* beta_ptr  = static_cast<const void*>(&beta);
+  if (use_fp4) {
+    dequant_fp4_gemm_inputs(param, *inputA, transa, *inputB, transb,
+                            m, n, k, alpha, workspace, workspaceSize,
+                            &alpha_ptr, stream);
+  }
+
+  bool nvte_log_gemm_config = false;
+  if (const char* env_p = std::getenv("NVTE_LOG_GEMM_CONFIG") ) {
+      nvte_log_gemm_config = (strcmp(env_p, "1") == 0);
+  }
+
+  if (nvte_log_gemm_config) {
+    const bool use_fp8 = is_fp8_dtype(param.Atype) || is_fp8_dtype(param.Btype);
+    const bool a_tensor = is_tensor_scaling(inputA->scaling_mode);
+    const bool a_block  = is_block_scaling(inputA->scaling_mode);
+
+    std::cout << "m=" << m << " k=" << k << " n=" << n 
+        << " transa=" << (param.transA == HIPBLAS_OP_T ? "T" : "N")
+        << " transb=" << (param.transB == HIPBLAS_OP_T ? "T" : "N")
+        << " A_type=" << (int)(param.Atype)
+        << " B_type=" << (int)(param.Btype)
+        << " D_type=" << (int)outputD->data.dtype
+        << " bias_type=" << (int)inputBias->data.dtype
+        << " grad=" << grad
+        << " bias=" << (inputBias->data.dptr != nullptr)
+        << " gelu=" << (outputPreGelu->data.dptr != nullptr)
+        << " use_fp8=" << use_fp8
+        << " scale_mode=" << (a_tensor ? "tensor" : a_block ? "mxfp8" : "unsupported")
+        << " alpha=" << alpha << " beta=" << beta
+        << std::endl;
+  }
+  
+  void *D = outputD->data.dptr;
+  void *C = D;
+  void *D_scale = outputD->scale.dptr;
+  void *D_amax = outputD->amax.dptr;
+  void *bias_ptr = inputBias->data.dptr;
+  const bool bias = bias_ptr != nullptr;
+  void *pre_gelu_out = outputPreGelu->data.dptr;
+  const bool gelu = pre_gelu_out != nullptr;
+  const bool use_fp8 = is_fp8_dtype(param.Atype) || is_fp8_dtype(param.Btype);
+
+  const hipDataType A_type = get_hipblaslt_dtype(param.Atype);
+  const hipDataType B_type = get_hipblaslt_dtype(param.Btype);
+  const hipDataType D_type = get_hipblaslt_dtype(outputD->data.dtype);
+  const hipDataType bias_type = get_hipblaslt_dtype(inputBias->data.dtype);
+  const hipDataType aux_type = get_hipblaslt_dtype(outputPreGelu->data.dtype);
+
+  NVTE_CHECK(!is_fp8_dtype(param.Atype) || param.A_scale_inv != nullptr,
+             "FP8 input to GEMM requires inverse of scale!");
+  NVTE_CHECK(!is_fp8_dtype(param.Btype) || param.B_scale_inv != nullptr,
+             "FP8 input to GEMM requires inverse of scale!");
+
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+  if (use_fp8 && gelu) {
+    hipDeviceProp_t prop;
+    NVTE_CHECK_CUDA(hipGetDeviceProperties(&prop, 0));
+    // Currently hipblasLT only supports fp8 gemm + gelu fusion only on MI300
+    if (prop.major == 9 && prop.minor == 4) {
+      bool allow_fp8_gemm = (param.Atype == DType::kFloat8E4M3) &&
+                          (param.Btype == DType::kFloat8E4M3) &&
+                          (outputD->data.dtype == DType::kFloat8E4M3) &&
+                          (!bias || inputBias->data.dtype == DType::kFloat16) &&
+                          (outputPreGelu->data.dtype == DType::kFloat16 || outputPreGelu->data.dtype == outputD->data.dtype);
+      NVTE_CHECK(allow_fp8_gemm, "fp8 gemm + gelu fusion is unavailable with current config!");
+    } else {
+      NVTE_CHECK(false, "fp8 gemm + gelu fusion is unavailable right now!");
+    }
+  }
+#else
+  // fp8 + gelu fusion + fp8 aux is unavailable right now.
+  if (use_fp8) {
+    NVTE_CHECK(!gelu, "fp8 gemm + gelu fusion is unavailable right now!");
+  }
+#endif
+
+  int device_id;
+  NVTE_CHECK_CUDA(hipGetDevice(&device_id));
+
+  if (handle == nullptr) {
+    handle = cached_handles.get(device_id);
+    if (handle == nullptr)
+    {
+      handle = cached_handles.obtain(device_id);
+    }
+  }
+
+  hipblasLtMatmulDesc_t       operationDesc = nullptr;
+  hipblasLtMatrixLayout_t     Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr, Ddesc = nullptr;
+  hipblasLtMatmulPreference_t preference = nullptr;
+  hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_DEFAULT;
+
+  int64_t ld_gelumat = (int64_t) ldd;
+
+  // default to tf32 except for e5m2 inputs where the config is not supported
+  hipblasComputeType_t gemm_compute_type = HIPBLAS_COMPUTE_32F;
+
+  // Create matrix descriptors. Not setting any extra attributes.
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutCreate(&Adesc, A_type,
+                                                   param.transA == HIPBLAS_OP_N ? m : k,
+                                                   param.transA == HIPBLAS_OP_N ? k : m,
+                                                   param.lda));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutCreate(&Bdesc, B_type,
+                                                   param.transB == HIPBLAS_OP_N ? k : n,
+                                                   param.transB == HIPBLAS_OP_N ? n : k,
+                                                   param.ldb));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutCreate(&Ddesc, D_type, m, n, ldd));
+  Cdesc = Ddesc;
+
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescCreate(&operationDesc, gemm_compute_type, HIP_R_32F));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                       &param.transA, sizeof(param.transA)));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                       &param.transB, sizeof(param.transB)));
+
+  // set fp8 attributes -- input and output types should already be set to fp8 as appropriate
+  // Note: gelu fusion is available for certain config from rocm 7.0
+  // amax(D) either (next op is high precision).
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+    hipblasLtMatmulMatrixScale_t scaling_mode = (hipblasLtMatmulMatrixScale_t)0;
+#else
+    constexpr int scaling_mode = 0;
+#endif
+  if (use_fp8) {
+    // Split accumulator.
+    const int8_t fastAccuMode = (use_split_accumulator) ? 0 : 1;
+    /*
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                     HIPBLASLT_MATMUL_DESC_FAST_ACCUM, //TODO: We don't have fast accum mode yet
+                                                     &fastAccuMode,
+                                                     sizeof(fastAccuMode)));
+    */
+    if ((is_delayed_tensor_scaling(inputA->scaling_mode) &&
+         is_delayed_tensor_scaling(inputB->scaling_mode))) {
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+      scaling_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    } else if ((is_block_scaling(inputA->scaling_mode) && is_block_scaling(inputB->scaling_mode))) {
+      scaling_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+      NVTE_CHECK(!is_fp8_dtype(outputD->data.dtype), "FP8 output is not supported with block scaling mode.");
+#endif
+    } else {
+      NVTE_ERROR("Not implemented scaling modes: " + to_string(inputA->scaling_mode) + " and  " +
+                 to_string(inputB->scaling_mode) + ".");
+    }
+    NVTE_CHECK_HIPBLASLT(
+        hipblasLtMatmulDescSetAttribute(operationDesc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                        &param.A_scale_inv, sizeof(param.A_scale_inv)));
+    NVTE_CHECK_HIPBLASLT(
+        hipblasLtMatmulDescSetAttribute(operationDesc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                        &param.B_scale_inv, sizeof(param.B_scale_inv)));
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+        operationDesc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaling_mode, sizeof(scaling_mode)));
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+        operationDesc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaling_mode, sizeof(scaling_mode)));
+#endif
+
+    if (is_fp8_dtype(outputD->data.dtype)) {
+      NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+        operationDesc, HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER, &D_scale, sizeof(D_scale)));
+      NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+        operationDesc, HIPBLASLT_MATMUL_DESC_AMAX_D_POINTER, &D_amax, sizeof(D_amax)));
+    }
+    if (bias) {
+      NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                       HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                                       &bias_type, sizeof(bias_type)));
+    }
+#if HIPBLASLT_VERSION_MAJOR > 0 || HIPBLASLT_VERSION_MINOR >= 15
+    if (gelu){
+      NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                        HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_DATA_TYPE,
+                                                        &aux_type,
+                                                        sizeof(aux_type)));
+    }
+#endif
+  }
+  
+  if (bias && gelu) {
+    if (grad) {
+      epilogue = HIPBLASLT_EPILOGUE_DGELU_BGRAD;
+    } else {
+      epilogue = HIPBLASLT_EPILOGUE_GELU_AUX_BIAS;
+    }
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                      HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                                      &bias_ptr, sizeof(bias_ptr)));
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+                            operationDesc, HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER,
+                            &pre_gelu_out, sizeof(pre_gelu_out)));
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                      HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD,
+                                                      &ld_gelumat, sizeof(ld_gelumat)));
+    // TODO: future enablement
+    //const hipDataType aux_type = get_hipblaslt_dtype(outputPreGelu->data.dtype);
+    //NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+    //  operationDesc, HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_DATA_TYPE, &aux_type, sizeof(aux_type)));
+  } else if (bias) {
+    if (grad) {
+      // grad output is always input B
+      epilogue = HIPBLASLT_EPILOGUE_BGRADB;
+    } else {
+      epilogue = HIPBLASLT_EPILOGUE_BIAS;
+    }
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                      HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                                      &bias_ptr, sizeof(bias_ptr)));
+  } else if (gelu) {
+    if (grad) {
+      epilogue = HIPBLASLT_EPILOGUE_DGELU;
+    } else {
+      epilogue = HIPBLASLT_EPILOGUE_GELU_AUX;
+    }
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+                            operationDesc, HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER,
+                            &pre_gelu_out, sizeof(pre_gelu_out)));
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                     HIPBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD,
+                                                     &ld_gelumat, sizeof(ld_gelumat)));
+  }
+
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                   HIPBLASLT_MATMUL_DESC_EPILOGUE,
+                                                   &epilogue, sizeof(epilogue)));
+
+    if (use_fp4) {
+    int32_t pointer_mode = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescSetAttribute(
+        operationDesc, HIPBLASLT_MATMUL_DESC_POINTER_MODE,
+        &pointer_mode, sizeof(pointer_mode)));
+  }
+
+  GemmAlgoCache::Key gemm_cfg(algoCache.device_cap(device_id), A_type, B_type, D_type, 
+    use_fp8 ? bias_type : (hipDataType)-1,
+    (use_fp8 && gelu) ? aux_type : (hipDataType)-1,
+    m, n, k, param.lda, param.ldb, ldd, param.transA, param.transB, scaling_mode, epilogue,
+    use_fp4);
+  GemmAlgoCache::Algo cached_algo;
+  if (algoCache.find(gemm_cfg, workspaceSize, cached_algo) == 0 || !cached_algo.algo.has_value())
+  {
+    bool logTuning = getIntEnv("TE_HIPBLASLT_LOG_TUNING", 0, 0) != 0;
+
+    // Find algo base algo_id directly if tuning file is set.
+    if (cached_algo.hasId())
+    {
+      std::vector<hipblasLtMatmulHeuristicResult_t> algo_arr;
+      std::vector<int> algo_index{static_cast<int>(cached_algo.algoId)};
+      
+      if (hipblaslt_ext::getAlgosFromIndex(handle, algo_index, algo_arr) == HIPBLAS_STATUS_SUCCESS &&
+          algo_arr[0].state == HIPBLAS_STATUS_SUCCESS) {
+        size_t ws_size_min = 0;
+        if (HIPBLAS_STATUS_SUCCESS == hipblaslt_ext::matmulIsAlgoSupported(
+          handle,
+          operationDesc, 
+          alpha_ptr,
+          Adesc, 
+          Bdesc, 
+          beta_ptr,
+          Ddesc,
+          Ddesc,
+          algo_arr[0].algo,
+          ws_size_min
+        )) {
+
+          if (ws_size_min <= workspaceSize && ws_size_min <= algo_arr[0].workspaceSize) {
+            cached_algo.algo = algo_arr[0].algo;
+            if (cached_algo.ws_size_min != algo_arr[0].workspaceSize) {
+              cached_algo.ws_size_min = algo_arr[0].workspaceSize;
+              algoCache.store(gemm_cfg, cached_algo);
+            }
+          }
+        }
+      }
+
+      if (logTuning && !cached_algo.algo.has_value()) {
+        std::cout << "[WARNING] Cannot get corresponding solution from cached algoId " << cached_algo.algoId << std::endl;
+      }
+    }
+
+    int firstAlgo = getIntEnv("TE_HIPBLASLT_ALGO_SELECTION", 0, 0);
+    int tuneLoopCount = getIntEnv("TE_HIPBLASLT_TUNING_RUN_COUNT", 0, 0);
+    int algoTuneCount = 1;
+    std::vector<hipblasLtMatmulHeuristicResult_t> algoArr;
+
+    if (tuneLoopCount)
+    {
+      /* HIPBLASLT may return hundreds of algos for some configs
+       * Limit amount by default. User may override with env
+       */
+      static const int defaultAlgoCount = 16;
+      algoTuneCount = getIntEnv("TE_HIPBLASLT_TUNING_ALGO_COUNT", defaultAlgoCount, 1);
+    }
+    algoTuneCount += firstAlgo;
+    algoArr.resize(algoTuneCount);
+
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulPreferenceCreate(&preference));
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulPreferenceSetAttribute(
+                            preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                            &workspaceSize, sizeof(workspaceSize)));
+
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc,
+                                                    Ddesc, preference, algoTuneCount, algoArr.data(),
+                                                    &algoTuneCount));
+    algoArr.resize(algoTuneCount);
+
+    NVTE_CHECK_HIPBLASLT(hipblasLtMatmulPreferenceDestroy(preference));
+
+    //No suitable entry in autotune cache or could not find matched algo in hipBLASLt results
+    if (!cached_algo.algo.has_value())
+    {
+
+      int bestAlgo = -1;
+      if (tuneLoopCount > 0)
+      {
+        if (logTuning)
+          std::cout << "[INFO] Perform hipBLASLt algo selection on GPU" << device_id
+                    << " in range [" << firstAlgo << "-" << (algoTuneCount - 1) << "] with "
+                    << tuneLoopCount << " loops " << std::endl;
+
+        NVTE_CHECK_CUDA(hipStreamSynchronize(stream));
+        hipStream_t &profilingStream = stream; // Reuse the stream for profiling
+        using tuning_clock = std::chrono::steady_clock;
+        tuning_clock::now(); //the first call takes little longer so do it outside the loop
+        tuning_clock::duration bestTime = tuning_clock::duration::max();
+
+        for (int algo=firstAlgo; algo<algoTuneCount; algo++)
+        {
+            if (algoArr[algo].state != HIPBLAS_STATUS_SUCCESS)
+            {
+              continue;
+            }
+            // Warm-up call
+            NVTE_CHECK_HIPBLASLT(hipblasLtMatmul(handle,
+                                            operationDesc,
+                                            alpha_ptr,                                /* alpha */
+                                            param.A,                                      /* A */
+                                            Adesc,
+                                            param.B,                                      /* B */
+                                            Bdesc,
+                                            beta_ptr,                                 /* beta */
+                                            C,                                      /* C */
+                                            Cdesc,
+                                            D,                                      /* D */
+                                            Ddesc,
+                                            &algoArr[algo].algo,                    /* algo */
+                                            workspace,                              /* workspace */
+                                            workspaceSize,
+                                            profilingStream));                       /* stream */
+          NVTE_CHECK_CUDA(hipStreamSynchronize(profilingStream));
+
+          //Profiling loop
+          tuning_clock::time_point startTime = tuning_clock::now();
+          for (int loop=0; loop<tuneLoopCount; loop++)
+          {
+            NVTE_CHECK_HIPBLASLT(hipblasLtMatmul(handle,
+                                            operationDesc,
+                                            alpha_ptr,                                /* alpha */
+                                            param.A,                                      /* A */
+                                            Adesc,
+                                            param.B,                                      /* B */
+                                            Bdesc,
+                                            beta_ptr,                                 /* beta */
+                                            C,                                      /* C */
+                                            Cdesc,
+                                            D,                                      /* D */
+                                            Ddesc,
+                                            &algoArr[algo].algo,                    /* algo */
+                                            workspace,                              /* workspace */
+                                            workspaceSize,
+                                            profilingStream));                       /* stream */
+          }
+          NVTE_CHECK_CUDA(hipStreamSynchronize(profilingStream));
+          tuning_clock::duration algoTime = tuning_clock::now() - startTime; 
+          if (algoTime < bestTime)
+          {
+            bestAlgo = algo;
+            bestTime = algoTime;
+          }
+        }
+
+        if (bestAlgo >= 0)
+        {
+          if (logTuning)
+            std::cout << "[INFO] Select hipBLASLt algo " << bestAlgo << " with time "
+                      << std::chrono::duration_cast<std::chrono::nanoseconds>(bestTime).count() / tuneLoopCount
+                      << " ns" << std::endl;
+        }
+      }
+      else if (firstAlgo < algoTuneCount)
+      {
+        bestAlgo = firstAlgo;
+      }
+
+      if (bestAlgo < 0) {
+        NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Ddesc));
+        NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Bdesc));
+        NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Adesc));
+        NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescDestroy(operationDesc));
+        throw std::runtime_error("Unable to find any suitable algorithms");
+      }
+      cached_algo.algo = algoArr[bestAlgo].algo;
+      cached_algo.index = bestAlgo;
+      cached_algo.algoId = cached_algo.getAlgoId(algoArr[bestAlgo].algo);
+      cached_algo.ws_size_min = algoArr[bestAlgo].workspaceSize;
+      cached_algo.ws_size_max = workspaceSize;
+
+      algoCache.store(gemm_cfg, cached_algo);
+    }
+
+    if (logTuning) {
+      std::cout << "[INFO] Use hipBLASLt algo [" << cached_algo.index << "] " << cached_algo.algoId << std::endl;
+    }
+  }
+
+  // D = alpha * (A * B) + beta * C
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmul(handle,
+                                   operationDesc,
+                                   alpha_ptr,                              /* alpha */
+                                   param.A,                                      /* A */
+                                   Adesc,
+                                   param.B,                                      /* B */
+                                   Bdesc,
+                                   beta_ptr,                               /* beta */
+                                   C,                                      /* C */
+                                   Cdesc,
+                                   D,                                      /* D */
+                                   Ddesc,
+                                   &cached_algo.algo.value(),              /* algo */
+                                   workspace,                              /* workspace */
+                                   workspaceSize,
+                                   stream));                               /* stream */
+
+  // Update FP8 scale-inv in output tensor
+  // Note: This is a WAR for the case when we have fp8 output but D->scale_inv is not allocated.
+  // TODO: Changing gemm interface so that D->scale_inv is allocated and the scale_inv can be
+  // calculated here.
+  if (is_fp8_dtype(outputD->data.dtype) && outputD->scale_inv.dptr) {
+    update_tensor_scale_inv(outputD, stream);
+  }
+
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Ddesc));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Bdesc));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatrixLayoutDestroy(Adesc));
+  NVTE_CHECK_HIPBLASLT(hipblasLtMatmulDescDestroy(operationDesc));
+}
+
+
+typedef unsigned long long ServiceStreamKey;
+
+ServiceStreamKey make_service_stream_key(const int device_id, const int cu_count) {
+  return (static_cast<ServiceStreamKey>(device_id) << 32) | static_cast<ServiceStreamKey>(cu_count);
+}
+
+std::pair<int, int> parse_service_stream_key(const ServiceStreamKey &key) {
+  int device_id = static_cast<int>(key >> 32);
+  int cu_count = static_cast<int>(key & 0xFFFFFFFF);
+  return std::make_pair(device_id, cu_count);
+}
+
+static ObjPool<hipStream_t, ServiceStreamKey> service_stream_pool;
+
+thread_local static ObjCache<hipStream_t, ServiceStreamKey> service_stream_cache(
+  [](const ObjCache<hipStream_t, ServiceStreamKey>::Data &d) { service_stream_pool.store(d); }
+);
+
+struct ServiceStreamCtl {
+  hipStream_t stream;
+  hipEvent_t start_event;
+  hipEvent_t end_event;
+};
+
+
+bool get_service_stream(int math_sm_count, hipStream_t stream, struct ServiceStreamCtl &ctl)
+{
+  if (math_sm_count == 0)
+    return false; // No service stream needed
+
+  int device_id;
+  int device_cu_count = 0;
+  NVTE_CHECK_CUDA(hipGetDevice(&device_id));
+  NVTE_CHECK_CUDA(hipDeviceGetAttribute(&device_cu_count, hipDeviceAttributeMultiprocessorCount, device_id));
+  if (math_sm_count < 0 || math_sm_count > device_cu_count)
+  {
+    std::cerr << "[WARNING] Invalid math_sm_count: " << math_sm_count << std::endl;
+    return false; // Invalid math_sm_count
+  }
+  else if (math_sm_count == device_cu_count)
+  {
+    return false; // math_sm_count == device_cu_count is equivalent to math_sm_count == 0
+  }
+
+  // Check if stream is capturing
+  hipStreamCaptureStatus captureStatus;
+  NVTE_CHECK_CUDA(hipStreamIsCapturing(stream, &captureStatus));
+  if (captureStatus != hipStreamCaptureStatusNone)
+  {
+    std::cerr << "[WARNING] Cannot use math_sm_count with captured stream" << std::endl;
+    return false; // Cannot use service stream with captured stream
+  }
+
+  ServiceStreamKey key = make_service_stream_key(device_id, math_sm_count);
+  CacheEntry<hipStream_t> streamEntry = service_stream_cache.get(key, stream);
+  if (!streamEntry.isValid()) {
+    /* There is no entry in the cache, try the following:
+      * 1. Try to acquire any available stream form the cache.
+      * 2. If not available, try to acquire any available stream form the pool.
+      * 3. If still not available, create a new stream and event. */
+    bool b_log = false;
+    if (const char* env_p = std::getenv("NVTE_LOG_MATH_SM_COUNT") ) {
+      b_log = (env_p != nullptr) && (std::string(env_p) == "1");
+    }
+    streamEntry = service_stream_cache.acquire(key, stream);
+    if (!streamEntry.isValid()) {
+      streamEntry = service_stream_pool.acquire(key, stream);
+    }
+    if (!streamEntry.isValid())
+    {
+      const uint32_t maskSize = (math_sm_count + 31) / 32;
+      std::vector<uint32_t> mask(maskSize, (uint32_t)-1);
+      if (math_sm_count % 32 != 0)
+      {
+        mask[maskSize-1] = (1UL << (math_sm_count % 32)) - 1;
+      }
+      NVTE_CHECK_CUDA(hipExtStreamCreateWithCUMask(&streamEntry.value, maskSize, mask.data()));
+      NVTE_CHECK_CUDA(hipEventCreateWithFlags(&streamEntry.event, hipEventDisableTiming));
+      if (b_log)
+      {
+        std::cout << "[DEBUG] Created service stream for device " << device_id
+                  << " with " << math_sm_count << " CUs" << std::endl;
+      }
+    }
+    else if (b_log)
+    {
+      std::cout << "[DEBUG] Reusing service stream for device " << device_id
+                << " with " << math_sm_count << " CUs" << std::endl;
+    }
+    service_stream_cache.set(key, stream, streamEntry);
+  }
+
+  ctl.stream = streamEntry.value;
+  ctl.end_event = streamEntry.event;
+  NVTE_CHECK_CUDA(hipEventCreateWithFlags(&ctl.start_event, hipEventDisableTiming));
+  NVTE_CHECK_CUDA(hipEventRecord(ctl.start_event, stream));
+  NVTE_CHECK_CUDA(hipStreamWaitEvent(ctl.stream, ctl.start_event, 0));
+  return true; 
+}
+
+void release_service_stream(hipStream_t stream, struct ServiceStreamCtl &ctl)
+{
+    NVTE_CHECK_CUDA(hipEventRecord(ctl.end_event, ctl.stream));
+    NVTE_CHECK_CUDA(hipStreamWaitEvent(stream, ctl.end_event, 0));
+    //TODO: when event are really destroyed (documentation says on devide synchronize) and how much overhead is to create them
+    //May need to store event in eventPool and reuse them after thy are recorded
+    NVTE_CHECK_CUDA(hipEventDestroy(ctl.start_event));
+}
+
+} // namespace
+
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wmissing-declarations"
+
+void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
+                 const Tensor *inputBias, Tensor *outputPreGelu, cublasOperation_t transa,
+                 cublasOperation_t transb, bool grad, void *workspace, size_t workspaceSize,
+                 const void* alpha_ptr, const void* beta_ptr, bool use_split_accumulator, int math_sm_count,
+                 [[maybe_unused]] int m_split, [[maybe_unused]] int n_split,
+                 [[maybe_unused]] bool gemm_producer, [[maybe_unused]] const Tensor *inputCounter,
+                 hipStream_t stream, int compute_stream_offset)
+{
+  // Tensor dims in row-major order
+  const int A0 = inputA->flat_first_dim();
+  const int A1 = inputA->flat_last_dim();
+  const int B0 = inputB->flat_first_dim();
+  const int B1 = inputB->flat_last_dim();
+
+  const bool is_transa = transa == CUBLAS_OP_T;
+  const bool is_transb = transb == CUBLAS_OP_T;
+
+  // GEMM dims in column-major order
+  const int m = is_transa ? A0 : A1;
+  const int n = is_transb ? B1 : B0;
+  const int k = is_transa ? A1 : A0;
+  NVTE_CHECK((is_transb ? B0 : B1) == k,
+             "GEMM inputs have incompatible dimensions (A is ", A0, "x", A1, ", B is ", B0, "x", B1,
+             ")");
+  // Check that K is a multiple of 128, and M/N are multiples of 16 for MXFP8 GEMM
+  if (inputA->scaling_mode == NVTE_MXFP8_1D_SCALING || inputB->scaling_mode == NVTE_MXFP8_1D_SCALING) {
+    NVTE_CHECK(inputBias->data.dptr == nullptr, "MXFP8 GEMM does not yet support bias.");
+    NVTE_CHECK((k % 128) == 0, "GEMM K dimension must be multiple of 128 for MXFP8 scaling (got K=", k, ")");
+    NVTE_CHECK((m % 16) == 0, "GEMM M dimension must be multiple of 16 for MXFP8 scaling (got M=", m, ")");
+    NVTE_CHECK((n % 16) == 0, "GEMM N dimension must be multiple of 16 for MXFP8 scaling (got N=", n, ")");
+  }
+
+  const int lda = is_transa ? k : m;
+  const int ldb = is_transb ? n : k;
+  const int ldd = m;
+
+  float alpha = *reinterpret_cast<const float *>(alpha_ptr);  // Assumed to be on CPU
+  float beta = *reinterpret_cast<const float *>(beta_ptr);  // Assumed to be on CPU
+
+  ServiceStreamCtl ss_ctl;
+  bool use_service_stream =
+      (math_sm_count != 0) ? get_service_stream(math_sm_count, stream, ss_ctl) : false;
+
+  int num_streams = nvte_get_num_compute_streams();
+  NVTE_CHECK(compute_stream_offset >= -1 && compute_stream_offset < num_streams);
+
+  hipblasLtHandle_t handle = nullptr;
+  if (compute_stream_offset != -1) {
+    // Init hipblaslt handles (once, globally)
+    static std::once_flag init_flag;
+    static std::vector<hipblasLtHandle_t> hipblaslt_handles(num_streams);
+    std::call_once(init_flag, init_hipblaslt_handles, hipblaslt_handles.data());
+
+    handle = hipblaslt_handles[compute_stream_offset];
+  }
+
+  hipblaslt_gemm(inputA, inputB, outputD, inputBias, outputPreGelu, m, n, k, lda, ldb, ldd, transa,
+                 transb, grad, workspace, workspaceSize, alpha, beta, use_split_accumulator,
+                 math_sm_count, use_service_stream ? ss_ctl.stream : stream, handle);
+
+  if (use_service_stream)
+  {
+    release_service_stream(stream, ss_ctl);
+  }
+}
+
+#pragma GCC diagnostic pop
+
+} //namespace transformer_engine
