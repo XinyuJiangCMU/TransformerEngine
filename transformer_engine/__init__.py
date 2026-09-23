@@ -23,6 +23,10 @@ else:
     _rocm_init.initialize()
     del _rocm_init
 
+# Reuse PyTorch's ROCm libraries before loading the TE native library.
+if os.getenv("NVTE_FRAMEWORK") == "pytorch":
+    import torch
+
 import transformer_engine.common
 
 _use_pytorch = True
